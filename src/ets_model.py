@@ -17,7 +17,7 @@ class ETSDecomposer:
     """ETS model fitting and decomposition for category-level forecasting"""
 
     def __init__(self,
-                 seasonal_periods: int = 7,
+                 seasonal_periods: int = 365,
                  trend: str = 'add',
                  seasonal: str = 'mul',
                  damped_trend: bool = True):
@@ -25,7 +25,7 @@ class ETSDecomposer:
         Initialize ETS decomposer
 
         Args:
-            seasonal_periods: Number of periods in seasonal cycle (7 for weekly)
+            seasonal_periods: Number of periods in seasonal cycle (365 for yearly)
             trend: Trend type ('add', 'mul', or None)
             seasonal: Seasonal type ('add', 'mul', or None)
             damped_trend: Use damped trend
@@ -287,7 +287,7 @@ class ETSDecomposer:
 
 
 def fit_ets_models(df: pd.DataFrame,
-                   seasonal_periods: int = 7,
+                   seasonal_periods: int = 365,
                    trend: str = 'add',
                    seasonal: str = 'mul',
                    damped_trend: bool = True) -> Tuple[pd.DataFrame, ETSDecomposer]:
@@ -296,7 +296,7 @@ def fit_ets_models(df: pd.DataFrame,
 
     Args:
         df: Category-day DataFrame with features
-        seasonal_periods: Seasonal period (default 7 for weekly)
+        seasonal_periods: Seasonal period (default 365 for yearly)
         trend: Trend type
         seasonal: Seasonal type
         damped_trend: Use damped trend

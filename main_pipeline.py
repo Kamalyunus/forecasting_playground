@@ -215,7 +215,7 @@ class ForecastingPipeline:
 
         self.feature_df, self.ets_decomposer = fit_ets_models(
             train_val_df,
-            seasonal_periods=7,
+            seasonal_periods=365,
             trend='add',
             seasonal='mul',
             damped_trend=True
