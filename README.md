@@ -7,7 +7,7 @@ A comprehensive hybrid forecasting system combining **Exponential Smoothing (ETS
 This MVP implements a production-ready forecasting pipeline that:
 
 - **Aggregates** SKU-day data to category-day level
-- **Engineers** ~40 features capturing seasonality, trends, and events
+- **Engineers** ~30 features capturing seasonality, trends, and events
 - **Fits** ETS models to capture structured patterns (weekly/annual seasonality)
 - **Trains** LightGBM on residuals to capture complex events (promotions, weather, holidays)
 - **Generates** 30-day ahead forecasts
@@ -30,7 +30,7 @@ SKU-Day Data
      ↓
 Category Aggregation
      ↓
-Feature Engineering (~40 features)
+Feature Engineering (~30 features)
      ↓
 ┌────────────────────┐
 │   ETS Model        │ → Captures trend + seasonality
@@ -109,7 +109,7 @@ python main_pipeline.py
 This will:
 1. Generate 2 years of synthetic SKU-day data (3 categories, 10 SKUs each)
 2. Aggregate to category-day level
-3. Engineer ~40 features
+3. Engineer ~30 features
 4. Fit ETS models
 5. Train LightGBM on residuals
 6. Generate 30-day forecasts
@@ -187,18 +187,18 @@ lgbm_model = LGBMResidualModel(params={
 - **Cyclical:** sin/cos encoding for weekly, monthly, and annual cycles
 - **Flags:** is_weekend
 
-### Lag Features (4)
-- lag_7, lag_14, lag_28, lag_364 (year-over-year)
+### Lag Features (3)
+- lag_7, lag_14, lag_28
 
-### Rolling Window Features (3)
-- rolling_mean_7, rolling_mean_28, rolling_mean_364
+### Rolling Window Features (2)
+- rolling_mean_7, rolling_mean_28
 
-### Promotion Features (6)
-- promo_intensity, avg_discount_pct, promo_flag
-- promo_lag_7, days_since_promo, future_promo_flag
+### Promotion Features (4)
+- promo_intensity, promo_flag
+- promo_lag_7, days_since_promo
 
-### OOS Features (2)
-- oos_loss_share, oos_lag_7, oos_adjusted_sales
+### Aggregation Features (1)
+- pct_skus_on_high_impact_promo (percentage of SKUs on high-impact promotions)
 
 ### Holiday Features (5)
 - days_to_holiday, days_from_holiday
@@ -211,7 +211,7 @@ lgbm_model = LGBMResidualModel(params={
 ### ETS-Derived Features (1)
 - ets_level (trend component)
 
-**Total: ~40 features** engineered for robust forecasting
+**Total: ~30 features** engineered for robust forecasting
 
 ## 📈 Evaluation Metrics
 
@@ -292,7 +292,7 @@ validate_aggregated_data(category_df)
 from src.feature_engineering import engineer_features
 
 feature_df = engineer_features(category_df)
-# Creates ~40 features automatically
+# Creates ~30 features automatically
 ```
 
 ### ETS Decomposition

@@ -327,20 +327,3 @@ def evaluate_forecast_components(df: pd.DataFrame,
     print(f"  MAPE: {avg_mape_improvement:.2f}% improvement")
 
     return results_df
-
-
-if __name__ == "__main__":
-    # Test evaluation module
-    print("Testing evaluation module...")
-
-    # Create sample data
-    np.random.seed(42)
-    n = 100
-
-    actual = np.random.uniform(100, 200, n)
-    predicted = actual + np.random.normal(0, 10, n)
-
-    # Evaluate
-    metrics = evaluate_forecast(actual, predicted, "Test Category")
-
-    print("\nTest completed successfully!")

@@ -1,11 +1,9 @@
 """
 LightGBM Model Module
 
-Trains LightGBM on ETS residuals to capture complex patterns:
-- Promotions and events
-- Weather impacts
-- Holiday effects
-- Other irregular patterns
+Trains a single pooled LightGBM model on ETS residuals from all categories.
+Since ETS captures category-specific trend/seasonality, the residuals represent
+common patterns (promotions, weather, holidays) that benefit from pooled learning.
 """
 
 import pandas as pd
@@ -17,17 +15,18 @@ warnings.filterwarnings('ignore')
 
 
 class LGBMResidualModel:
-    """LightGBM model for forecasting ETS residuals"""
+    """Pooled LightGBM model for forecasting ETS residuals across all categories"""
 
-    def __init__(self, params: Optional[Dict] = None):
+    def __init__(self, params: Optional[Dict] = None, tuned_params: Optional[Dict] = None):
         """
-        Initialize LightGBM model
+        Initialize pooled LightGBM model
 
         Args:
-            params: LightGBM parameters (default: MVP conservative params)
+            params: LightGBM parameters (default: conservative params)
+            tuned_params: Optuna-tuned parameters (dict with 'pooled' key)
         """
         if params is None:
-            self.params = {
+            self.default_params = {
                 'objective': 'regression',
                 'metric': 'mae',
                 'boosting_type': 'gbdt',
@@ -44,17 +43,18 @@ class LGBMResidualModel:
                 'seed': 42
             }
         else:
-            self.params = params
+            self.default_params = params
 
-        self.models: Dict[str, lgb.Booster] = {}
-        self.feature_importance: Dict[str, pd.DataFrame] = {}
-        self.train_history: Dict[str, Dict] = {}
+        self.tuned_params = tuned_params
+        self.model: Optional[lgb.Booster] = None
+        self.feature_importance: Optional[pd.DataFrame] = None
+        self.train_history: Optional[Dict] = None
 
     def prepare_features(self,
                         df: pd.DataFrame,
                         exclude_cols: Optional[List[str]] = None) -> Tuple[pd.DataFrame, List[str]]:
         """
-        Prepare feature matrix for training
+        Prepare feature matrix for training (includes category as feature)
 
         Args:
             df: DataFrame with all features
@@ -65,37 +65,42 @@ class LGBMResidualModel:
         """
         # Default exclusions
         default_exclude = [
-            'date', 'category', 'sales', 'oos_adjusted_sales',
-            'ets_fitted', 'ets_residual',  # Don't use fitted/residual as features
-            'actual',  # From ETS results
-            'holiday_name'  # Categorical, needs encoding if used
+            'date', 'sales',
+            'ets_fitted', 'ets_residual',
+            'actual',
+            'holiday_name',
+            'num_skus',  # Exclude raw SKU count (use pct_skus_on_high_impact_promo instead)
+            'high_impact_promo',  # Exclude raw promo count (use pct_skus_on_high_impact_promo instead)
+            'instock_rate'  # Exclude instock rate (not needed as feature)
         ]
 
         if exclude_cols:
             default_exclude.extend(exclude_cols)
 
-        # Get feature columns
+        # Get feature columns (including category)
         feature_cols = [col for col in df.columns if col not in default_exclude]
 
         # Handle missing values (forward fill, then backward fill, then 0)
         X = df[feature_cols].copy()
-        X = X.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        X = X.ffill().bfill().fillna(0)
+
+        # Encode category as categorical
+        if 'category' in X.columns:
+            X['category'] = X['category'].astype('category')
 
         return X, feature_cols
 
-    def train_category(self,
-                      df: pd.DataFrame,
-                      category: str,
-                      train_mask: np.ndarray,
-                      val_mask: np.ndarray,
-                      num_boost_round: int = 300,
-                      early_stopping_rounds: int = 30) -> lgb.Booster:
+    def train(self,
+             df: pd.DataFrame,
+             train_mask: np.ndarray,
+             val_mask: np.ndarray,
+             num_boost_round: int = 300,
+             early_stopping_rounds: int = 30) -> lgb.Booster:
         """
-        Train LightGBM for a single category
+        Train pooled LightGBM model on all categories
 
         Args:
-            df: DataFrame with features and ETS residuals
-            category: Category name
+            df: DataFrame with features and ETS residuals (all categories)
             train_mask: Boolean mask for training data
             val_mask: Boolean mask for validation data
             num_boost_round: Number of boosting rounds
@@ -104,37 +109,60 @@ class LGBMResidualModel:
         Returns:
             Trained LightGBM model
         """
-        print(f"\n  Training LightGBM for {category}...")
+        print("="*60)
+        print("TRAINING POOLED LIGHTGBM MODEL")
+        print("="*60)
+        print(f"\n  Training on all categories combined...")
 
-        # Filter category data
-        cat_df = df[df['category'] == category].copy()
-
-        # Get masks for this category
-        cat_train_mask = train_mask[df['category'] == category]
-        cat_val_mask = val_mask[df['category'] == category]
-
-        # Prepare features
-        X, feature_names = self.prepare_features(cat_df)
-        y = cat_df['ets_residual'].values
+        # Prepare features (include category as a feature)
+        X, feature_names = self.prepare_features(df)
+        y = df['ets_residual'].values
 
         # Split train/val
-        X_train = X[cat_train_mask]
-        y_train = y[cat_train_mask]
-        X_val = X[cat_val_mask]
-        y_val = y[cat_val_mask]
+        X_train = X[train_mask]
+        y_train = y[train_mask]
+        X_val = X[val_mask]
+        y_val = y[val_mask]
 
         print(f"    Train samples: {len(X_train)}, Val samples: {len(X_val)}")
-        print(f"    Features: {len(feature_names)}")
+        print(f"    Features: {len(feature_names)} (including category)")
+        print(f"    Categories: {df['category'].nunique()}")
         print(f"    Target (residual) - Mean: {y_train.mean():.2f}, Std: {y_train.std():.2f}")
 
+        # Identify categorical features
+        categorical_features = ['category'] if 'category' in feature_names else []
+
         # Create datasets
-        train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, feature_name=feature_names)
+        train_data = lgb.Dataset(
+            X_train,
+            label=y_train,
+            feature_name=feature_names,
+            categorical_feature=categorical_features
+        )
+        val_data = lgb.Dataset(
+            X_val,
+            label=y_val,
+            reference=train_data,
+            feature_name=feature_names,
+            categorical_feature=categorical_features
+        )
+
+        # Get parameters (check for tuned parameters)
+        if self.tuned_params and 'pooled' in self.tuned_params:
+            params = self.default_params.copy()
+            tuned = self.tuned_params['pooled'].copy()
+            if 'num_boost_round' in tuned:
+                num_boost_round = tuned.pop('num_boost_round')
+            params.update(tuned)
+            print(f"    Using tuned hyperparameters")
+        else:
+            params = self.default_params
+            print(f"    Using default hyperparameters")
 
         # Train model
         evals_result = {}
         model = lgb.train(
-            self.params,
+            params,
             train_data,
             num_boost_round=num_boost_round,
             valid_sets=[train_data, val_data],
@@ -147,8 +175,8 @@ class LGBMResidualModel:
         )
 
         # Store model and results
-        self.models[category] = model
-        self.train_history[category] = evals_result
+        self.model = model
+        self.train_history = evals_result
 
         # Feature importance
         importance_df = pd.DataFrame({
@@ -156,7 +184,7 @@ class LGBMResidualModel:
             'importance': model.feature_importance(importance_type='gain')
         }).sort_values('importance', ascending=False)
 
-        self.feature_importance[category] = importance_df
+        self.feature_importance = importance_df
 
         # Print results
         best_iteration = model.best_iteration
@@ -167,238 +195,73 @@ class LGBMResidualModel:
         print(f"    Train MAE: {train_mae:.2f}")
         print(f"    Val MAE: {val_mae:.2f}")
         print(f"    Top 5 features: {', '.join(importance_df.head(5)['feature'].tolist())}")
-        print(f"    ✓ LightGBM trained successfully")
-
-        return model
-
-    def train_all_categories(self,
-                            df: pd.DataFrame,
-                            train_mask: np.ndarray,
-                            val_mask: np.ndarray,
-                            **kwargs) -> None:
-        """
-        Train LightGBM for all categories
-
-        Args:
-            df: DataFrame with features and ETS residuals
-            train_mask: Boolean mask for training data
-            val_mask: Boolean mask for validation data
-            **kwargs: Additional arguments for train_category
-        """
-        print("="*60)
-        print("TRAINING LIGHTGBM MODELS")
-        print("="*60)
-
-        categories = df['category'].unique()
-        print(f"Categories to train: {list(categories)}")
-
-        for category in categories:
-            self.train_category(df, category, train_mask, val_mask, **kwargs)
+        print(f"    ✓ Pooled LightGBM trained successfully")
 
         print("\n" + "="*60)
         print("LIGHTGBM TRAINING COMPLETE")
         print("="*60)
-        print(f"Models trained: {len(self.models)}")
 
-    def predict_category(self,
-                        df: pd.DataFrame,
-                        category: str) -> np.ndarray:
+        return model
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Predict residuals for a category
+        Predict residuals using pooled model
 
         Args:
-            df: DataFrame with features
-            category: Category name
+            df: DataFrame with features (all categories)
 
         Returns:
             Predicted residuals
         """
-        if category not in self.models:
-            raise ValueError(f"No trained model for category: {category}")
+        if self.model is None:
+            raise ValueError("No trained model found. Call train() first.")
 
-        # Filter category data
-        cat_df = df[df['category'] == category].copy()
-
-        # Prepare features
-        X, _ = self.prepare_features(cat_df)
+        # Prepare features (include category)
+        X, _ = self.prepare_features(df)
 
         # Predict
-        model = self.models[category]
-        predictions = model.predict(X, num_iteration=model.best_iteration)
+        predictions = self.model.predict(X, num_iteration=self.model.best_iteration)
 
         return predictions
-
-    def predict_all_categories(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Predict residuals for all categories
-
-        Args:
-            df: DataFrame with features
-
-        Returns:
-            Predicted residuals for entire dataframe
-        """
-        predictions = np.zeros(len(df))
-
-        for category in df['category'].unique():
-            mask = df['category'] == category
-            predictions[mask] = self.predict_category(df, category)
-
-        return predictions
-
-    def plot_feature_importance(self,
-                               category: str,
-                               top_n: int = 20) -> None:
-        """
-        Plot feature importance for a category
-
-        Args:
-            category: Category name
-            top_n: Number of top features to plot
-        """
-        import matplotlib.pyplot as plt
-
-        if category not in self.feature_importance:
-            raise ValueError(f"No feature importance for category: {category}")
-
-        importance_df = self.feature_importance[category].head(top_n)
-
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.barh(importance_df['feature'], importance_df['importance'])
-        ax.set_xlabel('Importance (Gain)')
-        ax.set_title(f'{category}: Top {top_n} Most Important Features')
-        ax.invert_yaxis()
-        plt.tight_layout()
-        plt.savefig(f'outputs/plots/feature_importance_{category}.png', dpi=150, bbox_inches='tight')
-        print(f"Plot saved: outputs/plots/feature_importance_{category}.png")
-        plt.close()
-
-    def plot_training_history(self, category: str) -> None:
-        """
-        Plot training history (loss curves)
-
-        Args:
-            category: Category name
-        """
-        import matplotlib.pyplot as plt
-
-        if category not in self.train_history:
-            raise ValueError(f"No training history for category: {category}")
-
-        history = self.train_history[category]
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(history['train']['l1'], label='Train MAE', alpha=0.7)
-        ax.plot(history['val']['l1'], label='Val MAE', alpha=0.7)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('MAE')
-        ax.set_title(f'{category}: Training History')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(f'outputs/plots/training_history_{category}.png', dpi=150, bbox_inches='tight')
-        print(f"Plot saved: outputs/plots/training_history_{category}.png")
-        plt.close()
-
-    def get_feature_importance_summary(self, top_n: int = 10) -> pd.DataFrame:
-        """
-        Get feature importance summary across all categories
-
-        Args:
-            top_n: Number of top features per category
-
-        Returns:
-            Summary DataFrame
-        """
-        summaries = []
-
-        for category, importance_df in self.feature_importance.items():
-            top_features = importance_df.head(top_n).copy()
-            top_features['category'] = category
-            top_features['rank'] = range(1, len(top_features) + 1)
-            summaries.append(top_features)
-
-        combined = pd.concat(summaries, ignore_index=True)
-
-        return combined
 
 
 def split_train_val_test(df: pd.DataFrame,
                          train_days: int = 640,
                          val_days: int = 30,
-                         test_days: int = 30) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         test_days: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Create train/val/test splits (simple time-based split)
+    Split data into train/val/test by date
 
     Args:
-        df: DataFrame with date column
-        train_days: Number of training days
-        val_days: Number of validation days
-        test_days: Number of test days
+        df: DataFrame with 'date' column
+        train_days: Number of days for training
+        val_days: Number of days for validation
+        test_days: Number of days for testing
 
     Returns:
-        train_mask, val_mask, test_mask
+        train_df, val_df, test_df
     """
-    # Ensure sorted by date
-    df = df.sort_values(['category', 'date']).reset_index(drop=True)
-
-    # Get unique dates
+    # Get unique dates sorted
     unique_dates = sorted(df['date'].unique())
-    total_days = len(unique_dates)
 
-    print(f"\nCreating train/val/test splits...")
-    print(f"  Total unique dates: {total_days}")
-    print(f"  Train: {train_days} days")
-    print(f"  Val: {val_days} days")
-    print(f"  Test: {test_days} days")
-
-    # Define split points
+    # Calculate split points
     train_end_idx = train_days
-    val_end_idx = train_days + val_days
+    val_end_idx = train_end_idx + val_days
+    test_end_idx = val_end_idx + test_days
 
+    if test_end_idx > len(unique_dates):
+        raise ValueError(
+            f"Not enough data: need {test_end_idx} days, have {len(unique_dates)}"
+        )
+
+    # Get date ranges
     train_dates = unique_dates[:train_end_idx]
     val_dates = unique_dates[train_end_idx:val_end_idx]
-    test_dates = unique_dates[val_end_idx:val_end_idx + test_days]
-
-    # Create masks
-    train_mask = df['date'].isin(train_dates).values
-    val_mask = df['date'].isin(val_dates).values
-    test_mask = df['date'].isin(test_dates).values
-
-    print(f"\nSplit summary:")
-    print(f"  Train: {train_mask.sum()} records ({train_dates[0].date()} to {train_dates[-1].date()})")
-    print(f"  Val: {val_mask.sum()} records ({val_dates[0].date()} to {val_dates[-1].date()})")
-    print(f"  Test: {test_mask.sum()} records ({test_dates[0].date()} to {test_dates[-1].date()})")
-
-    return train_mask, val_mask, test_mask
-
-
-if __name__ == "__main__":
-    # Test LightGBM module
-    print("Testing LightGBM module...")
-
-    # Load data with ETS components
-    df = pd.read_csv("data/category_day_with_ets.csv")
-    df['date'] = pd.to_datetime(df['date'])
+    test_dates = unique_dates[val_end_idx:test_end_idx]
 
     # Create splits
-    train_mask, val_mask, test_mask = split_train_val_test(df)
+    train_df = df[df['date'].isin(train_dates)].copy()
+    val_df = df[df['date'].isin(val_dates)].copy()
+    test_df = df[df['date'].isin(test_dates)].copy()
 
-    # Train LightGBM
-    lgbm_model = LGBMResidualModel()
-    lgbm_model.train_all_categories(df, train_mask, val_mask)
-
-    # Generate predictions
-    predictions = lgbm_model.predict_all_categories(df)
-    df['lgbm_residual_pred'] = predictions
-
-    # Save
-    output_path = "data/category_day_with_lgbm.csv"
-    df.to_csv(output_path, index=False)
-    print(f"\nData with LGBM predictions saved to: {output_path}")
-
-    # Plot feature importance
-    print("\nGenerating feature importance plots...")
-    for category in df['category'].unique():
-        lgbm_model.plot_feature_importance(category)
-        lgbm_model.plot_training_history(category)
+    return train_df, val_df, test_df

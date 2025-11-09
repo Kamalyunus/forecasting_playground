@@ -20,7 +20,10 @@ class ETSDecomposer:
                  seasonal_periods: int = 365,
                  trend: str = 'add',
                  seasonal: str = 'mul',
-                 damped_trend: bool = True):
+                 damped_trend: bool = True,
+                 smoothing_level: Optional[float] = None,
+                 smoothing_trend: Optional[float] = None,
+                 smoothing_seasonal: Optional[float] = None):
         """
         Initialize ETS decomposer
 
@@ -29,11 +32,17 @@ class ETSDecomposer:
             trend: Trend type ('add', 'mul', or None)
             seasonal: Seasonal type ('add', 'mul', or None)
             damped_trend: Use damped trend
+            smoothing_level: Alpha parameter (higher = more weight to recent, 0-1)
+            smoothing_trend: Beta parameter (higher = more weight to recent, 0-1)
+            smoothing_seasonal: Gamma parameter (higher = more weight to recent, 0-1)
         """
         self.seasonal_periods = seasonal_periods
         self.trend = trend
         self.seasonal = seasonal
         self.damped_trend = damped_trend
+        self.smoothing_level = smoothing_level
+        self.smoothing_trend = smoothing_trend
+        self.smoothing_seasonal = smoothing_seasonal
 
         # Storage for fitted models and results
         self.models: Dict[str, ExponentialSmoothing] = {}
@@ -43,14 +52,14 @@ class ETSDecomposer:
     def fit_category(self,
                     df: pd.DataFrame,
                     category: str,
-                    target_col: str = 'oos_adjusted_sales') -> Tuple[object, pd.DataFrame]:
+                    target_col: str = 'sales') -> Tuple[object, pd.DataFrame]:
         """
         Fit ETS model for a single category
 
         Args:
             df: Category-day DataFrame
             category: Category name
-            target_col: Target column (use OOS-adjusted sales)
+            target_col: Target column (sales)
 
         Returns:
             fitted_model, results_df
@@ -78,7 +87,27 @@ class ETSDecomposer:
                 initialization_method='estimated'
             )
 
-            fitted_model = model.fit(optimized=True, use_brute=False)
+            # Fit with specified smoothing parameters or optimize
+            if self.smoothing_level is not None and self.smoothing_trend is not None and self.smoothing_seasonal is not None:
+                # Use specified smoothing parameters (all must be provided)
+                fit_kwargs = {
+                    'smoothing_level': self.smoothing_level,
+                    'smoothing_trend': self.smoothing_trend,
+                    'smoothing_seasonal': self.smoothing_seasonal,
+                    'optimized': False
+                }
+                # If using damped trend, need to provide damping parameter
+                if self.damped_trend:
+                    fit_kwargs['damping_trend'] = 0.98  # Standard damping value
+
+                fitted_model = model.fit(**fit_kwargs)
+                print(f"    Using specified smoothing: α={self.smoothing_level}, β={self.smoothing_trend}, γ={self.smoothing_seasonal}")
+            else:
+                # Optimize smoothing parameters
+                fitted_model = model.fit(optimized=True, use_brute=False)
+                print(f"    Optimized smoothing: α={fitted_model.params['smoothing_level']:.3f}, "
+                      f"β={fitted_model.params.get('smoothing_trend', 0):.3f}, "
+                      f"γ={fitted_model.params.get('smoothing_seasonal', 0):.3f}")
 
             # Extract components
             fitted_values = fitted_model.fittedvalues
@@ -119,6 +148,8 @@ class ETSDecomposer:
 
         except Exception as e:
             print(f"    ✗ Error fitting ETS model: {str(e)}")
+            import traceback
+            traceback.print_exc()
             print(f"    Using simple moving average fallback...")
 
             # Fallback: Use simple moving average
@@ -135,6 +166,8 @@ class ETSDecomposer:
                 'ets_level': level,
             })
 
+            # Store None model and results for fallback forecasting
+            self.fitted_models[category] = None
             self.results[category] = results_df
 
             return None, results_df
@@ -239,58 +272,15 @@ class ETSDecomposer:
 
         return self.results[category]['ets_residual']
 
-    def plot_decomposition(self, category: str) -> None:
-        """
-        Plot ETS decomposition for a category
-
-        Args:
-            category: Category name
-        """
-        import matplotlib.pyplot as plt
-
-        if category not in self.results:
-            raise ValueError(f"No results for category: {category}")
-
-        results_df = self.results[category]
-
-        fig, axes = plt.subplots(4, 1, figsize=(15, 10))
-
-        # Actual vs Fitted
-        axes[0].plot(results_df['date'], results_df['actual'], label='Actual', alpha=0.7)
-        axes[0].plot(results_df['date'], results_df['ets_fitted'], label='ETS Fitted', alpha=0.7)
-        axes[0].set_title(f'{category}: Actual vs ETS Fitted')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-
-        # Level (Trend)
-        axes[1].plot(results_df['date'], results_df['ets_level'])
-        axes[1].set_title(f'{category}: ETS Level (Trend)')
-        axes[1].grid(True, alpha=0.3)
-
-        # Residuals
-        axes[2].plot(results_df['date'], results_df['ets_residual'])
-        axes[2].axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        axes[2].set_title(f'{category}: ETS Residuals')
-        axes[2].grid(True, alpha=0.3)
-
-        # Residual distribution
-        axes[3].hist(results_df['ets_residual'], bins=50, edgecolor='black', alpha=0.7)
-        axes[3].set_title(f'{category}: Residual Distribution')
-        axes[3].set_xlabel('Residual')
-        axes[3].set_ylabel('Frequency')
-        axes[3].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(f'outputs/plots/ets_decomposition_{category}.png', dpi=150, bbox_inches='tight')
-        print(f"Plot saved: outputs/plots/ets_decomposition_{category}.png")
-        plt.close()
-
 
 def fit_ets_models(df: pd.DataFrame,
                    seasonal_periods: int = 365,
                    trend: str = 'add',
                    seasonal: str = 'mul',
-                   damped_trend: bool = True) -> Tuple[pd.DataFrame, ETSDecomposer]:
+                   damped_trend: bool = True,
+                   smoothing_level: Optional[float] = None,
+                   smoothing_trend: Optional[float] = None,
+                   smoothing_seasonal: Optional[float] = None) -> Tuple[pd.DataFrame, ETSDecomposer]:
     """
     Convenience function to fit ETS models
 
@@ -300,6 +290,9 @@ def fit_ets_models(df: pd.DataFrame,
         trend: Trend type
         seasonal: Seasonal type
         damped_trend: Use damped trend
+        smoothing_level: Alpha parameter (higher = more weight to recent, 0-1)
+        smoothing_trend: Beta parameter (higher = more weight to recent, 0-1)
+        smoothing_seasonal: Gamma parameter (higher = more weight to recent, 0-1)
 
     Returns:
         DataFrame with ETS components, ETSDecomposer object
@@ -308,31 +301,12 @@ def fit_ets_models(df: pd.DataFrame,
         seasonal_periods=seasonal_periods,
         trend=trend,
         seasonal=seasonal,
-        damped_trend=damped_trend
+        damped_trend=damped_trend,
+        smoothing_level=smoothing_level,
+        smoothing_trend=smoothing_trend,
+        smoothing_seasonal=smoothing_seasonal
     )
 
     df_with_ets = decomposer.fit_all_categories(df)
 
     return df_with_ets, decomposer
-
-
-if __name__ == "__main__":
-    # Test ETS module
-    print("Testing ETS module...")
-
-    # Load feature data
-    df = pd.read_csv("data/category_day_features.csv")
-    df['date'] = pd.to_datetime(df['date'])
-
-    # Fit ETS models
-    df_with_ets, decomposer = fit_ets_models(df)
-
-    # Save
-    output_path = "data/category_day_with_ets.csv"
-    df_with_ets.to_csv(output_path, index=False)
-    print(f"\nData with ETS components saved to: {output_path}")
-
-    # Plot decompositions
-    print("\nGenerating decomposition plots...")
-    for category in df['category'].unique():
-        decomposer.plot_decomposition(category)

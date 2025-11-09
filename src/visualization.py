@@ -348,26 +348,3 @@ def create_all_visualizations(train_df: pd.DataFrame,
     print("VISUALIZATION COMPLETE")
     print("="*60)
     print(f"All plots saved to: {output_dir}/")
-
-
-if __name__ == "__main__":
-    # Test visualization module
-    print("Testing visualization module...")
-
-    # Create sample data
-    np.random.seed(42)
-    dates = pd.date_range('2023-01-01', periods=30, freq='D')
-
-    df = pd.DataFrame({
-        'date': dates,
-        'category': 'Test',
-        'sales': np.random.uniform(100, 200, 30),
-        'final_forecast': np.random.uniform(90, 210, 30),
-        'ets_forecast': np.random.uniform(95, 205, 30),
-        'lgbm_residual_forecast': np.random.normal(0, 10, 30)
-    })
-
-    # Test plot
-    plot_forecast_vs_actual(df, 'Test', save_path='outputs/plots/test_plot.png')
-
-    print("Test completed successfully!")

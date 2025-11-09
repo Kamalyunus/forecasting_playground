@@ -9,6 +9,10 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 from datetime import timedelta
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from config import FEATURE_CONFIG
 
 
 class HybridForecaster:
@@ -88,14 +92,14 @@ class HybridForecaster:
         # LAG FEATURES (look back into historical data)
         # ========================================================================
         # Combine historical sales with forecasted sales (updated iteratively)
-        oos_adj_sales = cat_hist['oos_adjusted_sales'].values
-        extended_sales = oos_adj_sales.copy()
+        historical_sales = cat_hist['sales'].values
+        extended_sales = historical_sales.copy()
 
-        for lag in [7, 14, 28, 364]:
+        for lag in FEATURE_CONFIG['lag_periods']:
             lag_values = []
             for i in range(forecast_horizon):
                 # Look back lag days from current forecast date
-                lookback_idx = len(oos_adj_sales) + i - lag
+                lookback_idx = len(historical_sales) + i - lag
 
                 if lookback_idx >= 0 and lookback_idx < len(extended_sales):
                     lag_values.append(extended_sales[lookback_idx])
@@ -111,13 +115,10 @@ class HybridForecaster:
         # ROLLING FEATURES (calculated from extended series)
         # ========================================================================
         # Similar approach - for MVP, use historical rolling means
-        last_rolling_7 = cat_hist['rolling_mean_7'].iloc[-1]
-        last_rolling_28 = cat_hist['rolling_mean_28'].iloc[-1]
-        last_rolling_364 = cat_hist['rolling_mean_364'].iloc[-1]
-
-        future_df['rolling_mean_7'] = last_rolling_7
-        future_df['rolling_mean_28'] = last_rolling_28
-        future_df['rolling_mean_364'] = last_rolling_364
+        for window in FEATURE_CONFIG['rolling_windows']:
+            col_name = f'rolling_mean_{window}'
+            last_rolling = cat_hist[col_name].iloc[-1]
+            future_df[col_name] = last_rolling
 
         # ========================================================================
         # PROMOTION FEATURES
@@ -126,7 +127,7 @@ class HybridForecaster:
             # Merge with future promotion plan
             future_promo = future_promo_plan[future_promo_plan['category'] == category]
             future_df = future_df.merge(
-                future_promo[['date', 'promo_intensity', 'promo_flag', 'avg_discount_pct']],
+                future_promo[['date', 'promo_intensity', 'promo_flag']],
                 on='date',
                 how='left'
             )
@@ -134,7 +135,6 @@ class HybridForecaster:
             # Assume no promotions (MVP default)
             future_df['promo_intensity'] = 0.0
             future_df['promo_flag'] = 0
-            future_df['avg_discount_pct'] = 0.0
 
         # Promo lag (look back 7 days)
         future_df['promo_lag_7'] = np.nan
@@ -149,19 +149,25 @@ class HybridForecaster:
                                                    last_promo_days + forecast_horizon + 1)
 
         # ========================================================================
-        # OOS FEATURES (assume minimal OOS in future)
+        # AGGREGATION FEATURES (percentage-based promo features)
         # ========================================================================
-        future_df['oos_loss_share'] = 0.05  # 5% baseline
-        future_df['oos_lag_7'] = cat_hist['oos_loss_share'].iloc[-7:].mean()
+        # Percentage of SKUs on high impact promo: Conservative assumption of 0% (no high-impact promos in future)
+        future_df['pct_skus_on_high_impact_promo'] = 0.0
+
+        # Legacy columns (kept for model compatibility, but not used as features)
+        future_df['high_impact_promo'] = 0.0  # Number of SKUs on promo (not used as feature)
+        future_df['num_skus'] = cat_hist['num_skus'].iloc[-1] if 'num_skus' in cat_hist.columns else 10.0
 
         # ========================================================================
-        # HOLIDAY FEATURES (use holiday calendar)
+        # INSTOCK FEATURES (not used as features, excluded from model)
         # ========================================================================
-        # For MVP, replicate holiday detection logic
-        # Simplified: check known holidays
-        future_df['holiday_flag'] = 0
-        future_df['days_to_holiday'] = 999
-        future_df['days_from_holiday'] = 999
+        # Instock rate excluded from features but kept for data completeness
+        future_df['instock_rate'] = 95.0  # 95% baseline (good stock)
+
+        # ========================================================================
+        # HOLIDAY FEATURES (assume no holidays in future - MVP)
+        # ========================================================================
+        future_df['holiday_flag'] = -100  # No nearby holidays (default)
         future_df['is_pre_holiday'] = 0
         future_df['is_holiday_peak'] = 0
         future_df['is_post_holiday'] = 0
@@ -173,7 +179,7 @@ class HybridForecaster:
             # Merge with future weather forecast
             future_weather_cat = future_weather[future_weather['category'] == category]
             future_df = future_df.merge(
-                future_weather_cat[['date', 'temperature', 'precipitation']],
+                future_weather_cat[['date', 'avg_temperature', 'avg_rainfall', 'avg_snowfall']],
                 on='date',
                 how='left'
             )
@@ -189,23 +195,28 @@ class HybridForecaster:
                 ]
 
                 if len(similar_days) > 0:
-                    future_df.loc[i, 'temperature'] = similar_days['temperature'].mean()
-                    future_df.loc[i, 'precipitation'] = similar_days['precipitation'].mean()
+                    future_df.loc[i, 'avg_temperature'] = similar_days['avg_temperature'].mean()
+                    future_df.loc[i, 'avg_rainfall'] = similar_days['avg_rainfall'].mean()
+                    future_df.loc[i, 'avg_snowfall'] = similar_days['avg_snowfall'].mean()
                 else:
-                    future_df.loc[i, 'temperature'] = cat_hist['temperature'].mean()
-                    future_df.loc[i, 'precipitation'] = 0.0
+                    future_df.loc[i, 'avg_temperature'] = cat_hist['avg_temperature'].mean()
+                    future_df.loc[i, 'avg_rainfall'] = 0.0
+                    future_df.loc[i, 'avg_snowfall'] = 0.0
+
+        # Total precipitation (rain + snow)
+        future_df['total_precipitation'] = future_df['avg_rainfall'] + future_df['avg_snowfall']
 
         # Weather derived features
-        future_df['temp_rolling_avg_14'] = future_df['temperature'].rolling(14, min_periods=1).mean()
-        future_df['temp_deviation'] = future_df['temperature'] - future_df['temp_rolling_avg_14']
+        future_df['temp_rolling_avg_14'] = future_df['avg_temperature'].rolling(14, min_periods=1).mean()
+        future_df['temp_deviation'] = future_df['avg_temperature'] - future_df['temp_rolling_avg_14']
 
-        temp_10th = cat_hist['temperature'].quantile(0.1)
-        temp_90th = cat_hist['temperature'].quantile(0.9)
-        precip_90th = cat_hist['precipitation'].quantile(0.9)
+        temp_10th = cat_hist['avg_temperature'].quantile(0.1)
+        temp_90th = cat_hist['avg_temperature'].quantile(0.9)
+        precip_90th = cat_hist['total_precipitation'].quantile(0.9)
 
-        future_df['is_extreme_cold'] = (future_df['temperature'] < temp_10th).astype(int)
-        future_df['is_extreme_hot'] = (future_df['temperature'] > temp_90th).astype(int)
-        future_df['heavy_precip_flag'] = (future_df['precipitation'] > precip_90th).astype(int)
+        future_df['is_extreme_cold'] = (future_df['avg_temperature'] < temp_10th).astype(int)
+        future_df['is_extreme_hot'] = (future_df['avg_temperature'] > temp_90th).astype(int)
+        future_df['heavy_precip_flag'] = (future_df['total_precipitation'] > precip_90th).astype(int)
 
         # ========================================================================
         # ETS FEATURES
@@ -214,9 +225,9 @@ class HybridForecaster:
         last_ets_level = cat_hist['ets_level'].iloc[-1]
         future_df['ets_level'] = last_ets_level
 
-        # Additional required features from original data
-        future_df['base_price'] = cat_hist['base_price'].mean()
-        future_df['final_price'] = cat_hist['final_price'].mean()
+        # Use last available final price
+        if 'final_sku_price' in cat_hist.columns:
+            future_df['final_sku_price'] = cat_hist['final_sku_price'].iloc[-1]
 
         return future_df
 
@@ -247,15 +258,21 @@ class HybridForecaster:
             historical_df, category, forecast_horizon, **kwargs
         )
 
-        # Step 3: Predict residuals with LightGBM
-        # Need to match feature columns exactly
-        feature_cols = self.lgbm_model.models[category].feature_name()
-        X_future = future_features[feature_cols].copy()
-        X_future = X_future.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        # Step 3: Predict residuals with LightGBM (pooled model)
+        model = self.lgbm_model.model
+        if model is None:
+            raise ValueError("No trained model found in LGBMResidualModel")
 
-        lgbm_residual_forecast = self.lgbm_model.models[category].predict(
+        feature_cols = model.feature_name()
+        X_future = future_features[feature_cols].copy()
+        # Handle missing values BEFORE categorical encoding
+        X_future = X_future.ffill().bfill().fillna(0)
+        # Ensure category is encoded AFTER fillna
+        if 'category' in X_future.columns:
+            X_future['category'] = X_future['category'].astype('category')
+        lgbm_residual_forecast = model.predict(
             X_future,
-            num_iteration=self.lgbm_model.models[category].best_iteration
+            num_iteration=model.best_iteration
         )
 
         # Step 4: Combine forecasts
@@ -319,12 +336,3 @@ class HybridForecaster:
         print(f"Total forecast records: {len(combined_forecasts)}")
 
         return combined_forecasts
-
-
-if __name__ == "__main__":
-    # Test forecast module
-    print("Testing forecast module...")
-
-    # Load required modules and data
-    # (This would be run after training in main pipeline)
-    pass

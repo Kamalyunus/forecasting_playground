@@ -1,9 +1,8 @@
 """
 Feature Engineering Module
 
-Creates ~40 features for category-day forecasting:
+Creates ~30 features for category-day forecasting:
 - Temporal features (weekly and annual seasonality)
-- OOS-adjusted sales and OOS features
 - Lag and rolling window features
 - Promotion features
 - Holiday features
@@ -13,7 +12,10 @@ Creates ~40 features for category-day forecasting:
 
 import pandas as pd
 import numpy as np
-from typing import Optional, List
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from config import FEATURE_CONFIG
 
 
 class FeatureEngineer:
@@ -44,10 +46,8 @@ class FeatureEngineer:
         print("Creating all features...")
         print(f"Starting columns: {len(self.df.columns)}")
 
-        # Order matters: OOS adjustment must come first
-        self.create_oos_adjusted_sales()
+        # Create features
         self.create_temporal_features()
-        self.create_oos_features()
         self.create_lag_features()
         self.create_rolling_features()
         self.create_promotion_features()
@@ -57,10 +57,10 @@ class FeatureEngineer:
         print(f"\nFinal columns: {len(self.df.columns)}")
         print(f"Features created: {len(self.features_created)}")
         print(f"\nFeature summary by category:")
-        for category in ['Temporal', 'OOS', 'Lags', 'Rolling', 'Promotion', 'Holiday', 'Weather']:
+        for category in ['Temporal', 'Lags', 'Rolling', 'Promotion', 'Holiday', 'Weather']:
             cat_features = [f for f in self.features_created if category.lower() in f.lower() or
                           (category == 'Temporal' and any(x in f for x in ['day_', 'week_', 'month_', 'is_weekend'])) or
-                          (category == 'Lags' and 'lag_' in f and 'oos' not in f and 'promo' not in f) or
+                          (category == 'Lags' and 'lag_' in f and 'promo' not in f and 'instock' not in f) or
                           (category == 'Rolling' and 'rolling' in f)]
             if cat_features:
                 print(f"  {category}: {len(cat_features)} features")
@@ -116,47 +116,18 @@ class FeatureEngineer:
         print(f"   Created {len(temporal_features)} temporal features")
 
     # ========================================================================
-    # OOS FEATURES
-    # ========================================================================
-
-    def create_oos_adjusted_sales(self) -> None:
-        """Create OOS-adjusted sales (true demand estimate)"""
-        print("\n2. Creating OOS-adjusted sales...")
-
-        # Clip OOS to prevent division by zero
-        self.df['oos_loss_share'] = self.df['oos_loss_share'].clip(upper=0.99)
-
-        # Calculate OOS-adjusted sales
-        self.df['oos_adjusted_sales'] = self.df['sales'] / (1 - self.df['oos_loss_share'])
-
-        self.features_created.append('oos_adjusted_sales')
-        print(f"   Created OOS-adjusted sales")
-        print(f"   Avg adjustment: {(self.df['oos_adjusted_sales'] / self.df['sales']).mean():.3f}x")
-
-    def create_oos_features(self) -> None:
-        """Create OOS-related features"""
-        print("\n3. Creating OOS features...")
-
-        # OOS lag (7 days)
-        self.df['oos_lag_7'] = self.df.groupby('category')['oos_loss_share'].shift(7)
-
-        oos_features = ['oos_lag_7']
-        self.features_created.extend(oos_features)
-        print(f"   Created {len(oos_features)} OOS features")
-
-    # ========================================================================
     # LAG FEATURES
     # ========================================================================
 
     def create_lag_features(self) -> None:
-        """Create lag features using OOS-adjusted sales"""
-        print("\n4. Creating lag features...")
+        """Create lag features using sales"""
+        print("\n2. Creating lag features...")
 
-        lags = [7, 14, 28, 364]
+        lags = FEATURE_CONFIG['lag_periods']
 
         for lag in lags:
             col_name = f'lag_{lag}'
-            self.df[col_name] = self.df.groupby('category')['oos_adjusted_sales'].shift(lag)
+            self.df[col_name] = self.df.groupby('category')['sales'].shift(lag)
             self.features_created.append(col_name)
 
         print(f"   Created {len(lags)} lag features: {lags}")
@@ -166,34 +137,22 @@ class FeatureEngineer:
     # ========================================================================
 
     def create_rolling_features(self) -> None:
-        """Create rolling window features using OOS-adjusted sales"""
-        print("\n5. Creating rolling window features...")
+        """Create rolling window features using sales"""
+        print("\n3. Creating rolling window features...")
 
-        # Rolling mean 7 days
-        self.df['rolling_mean_7'] = (
-            self.df.groupby('category')['oos_adjusted_sales']
-            .rolling(7, min_periods=7)
-            .mean()
-            .reset_index(level=0, drop=True)
-        )
+        windows = FEATURE_CONFIG['rolling_windows']
+        rolling_features = []
 
-        # Rolling mean 28 days
-        self.df['rolling_mean_28'] = (
-            self.df.groupby('category')['oos_adjusted_sales']
-            .rolling(28, min_periods=28)
-            .mean()
-            .reset_index(level=0, drop=True)
-        )
+        for window in windows:
+            col_name = f'rolling_mean_{window}'
+            self.df[col_name] = (
+                self.df.groupby('category')['sales']
+                .rolling(window, min_periods=window)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            rolling_features.append(col_name)
 
-        # Year-over-year rolling mean (7-day window around lag 364)
-        shifted_364 = self.df.groupby('category')['oos_adjusted_sales'].shift(364)
-        self.df['rolling_mean_364'] = (
-            shifted_364
-            .rolling(7, center=True, min_periods=7)
-            .mean()
-        )
-
-        rolling_features = ['rolling_mean_7', 'rolling_mean_28', 'rolling_mean_364']
         self.features_created.extend(rolling_features)
         print(f"   Created {len(rolling_features)} rolling window features")
 
@@ -203,7 +162,7 @@ class FeatureEngineer:
 
     def create_promotion_features(self) -> None:
         """Create promotion-related features"""
-        print("\n6. Creating promotion features...")
+        print("\n4. Creating promotion features...")
 
         # Historical promotion lag
         self.df['promo_lag_7'] = self.df.groupby('category')['promo_intensity'].shift(7)
@@ -239,20 +198,26 @@ class FeatureEngineer:
     # ========================================================================
 
     def create_holiday_features(self) -> None:
-        """Create holiday-related features"""
-        print("\n7. Creating holiday features...")
+        """Create holiday-related features from holiday_flag"""
+        print("\n5. Creating holiday features...")
+
+        # Holiday flag format: 14 to -5 for holiday period, -100 for regular days
+        # Positive values = days before holiday
+        # 0 = holiday day
+        # Negative values (-1 to -5) = days after holiday
+        # -100 = regular day
 
         # Create holiday phase indicators
         self.df['is_pre_holiday'] = (
-            (self.df['days_to_holiday'] >= -7) &
-            (self.df['days_to_holiday'] <= -1)
+            (self.df['holiday_flag'] >= 1) &
+            (self.df['holiday_flag'] <= 7)
         ).astype(int)
 
-        self.df['is_holiday_peak'] = (self.df['days_to_holiday'] == 0).astype(int)
+        self.df['is_holiday_peak'] = (self.df['holiday_flag'] == 0).astype(int)
 
         self.df['is_post_holiday'] = (
-            (self.df['days_from_holiday'] >= 1) &
-            (self.df['days_from_holiday'] <= 7)
+            (self.df['holiday_flag'] >= -5) &
+            (self.df['holiday_flag'] <= -1)
         ).astype(int)
 
         holiday_features = ['is_pre_holiday', 'is_holiday_peak', 'is_post_holiday']
@@ -265,18 +230,21 @@ class FeatureEngineer:
 
     def create_weather_features(self) -> None:
         """Create weather-related features"""
-        print("\n8. Creating weather features...")
+        print("\n6. Creating weather features...")
 
         # Temperature rolling average (14 days)
         self.df['temp_rolling_avg_14'] = (
-            self.df.groupby('category')['temperature']
+            self.df.groupby('category')['avg_temperature']
             .rolling(14, min_periods=14)
             .mean()
             .reset_index(level=0, drop=True)
         )
 
         # Temperature deviation from recent norm
-        self.df['temp_deviation'] = self.df['temperature'] - self.df['temp_rolling_avg_14']
+        self.df['temp_deviation'] = self.df['avg_temperature'] - self.df['temp_rolling_avg_14']
+
+        # Total precipitation (rain + snow)
+        self.df['total_precipitation'] = self.df['avg_rainfall'] + self.df['avg_snowfall']
 
         # Extreme temperature flags (per category)
         self.df['is_extreme_cold'] = 0
@@ -287,66 +255,29 @@ class FeatureEngineer:
             mask = self.df['category'] == category
 
             # Temperature extremes (10th and 90th percentiles)
-            temp_10th = self.df.loc[mask, 'temperature'].quantile(0.1)
-            temp_90th = self.df.loc[mask, 'temperature'].quantile(0.9)
+            temp_10th = self.df.loc[mask, 'avg_temperature'].quantile(0.1)
+            temp_90th = self.df.loc[mask, 'avg_temperature'].quantile(0.9)
 
             self.df.loc[mask, 'is_extreme_cold'] = (
-                self.df.loc[mask, 'temperature'] < temp_10th
+                self.df.loc[mask, 'avg_temperature'] < temp_10th
             ).astype(int)
 
             self.df.loc[mask, 'is_extreme_hot'] = (
-                self.df.loc[mask, 'temperature'] > temp_90th
+                self.df.loc[mask, 'avg_temperature'] > temp_90th
             ).astype(int)
 
-            # Heavy precipitation (90th percentile)
-            precip_90th = self.df.loc[mask, 'precipitation'].quantile(0.9)
+            # Heavy precipitation (90th percentile - total rain + snow)
+            precip_90th = self.df.loc[mask, 'total_precipitation'].quantile(0.9)
             self.df.loc[mask, 'heavy_precip_flag'] = (
-                self.df.loc[mask, 'precipitation'] > precip_90th
+                self.df.loc[mask, 'total_precipitation'] > precip_90th
             ).astype(int)
 
         weather_features = [
-            'temp_rolling_avg_14', 'temp_deviation',
+            'temp_rolling_avg_14', 'temp_deviation', 'total_precipitation',
             'is_extreme_cold', 'is_extreme_hot', 'heavy_precip_flag'
         ]
         self.features_created.extend(weather_features)
         print(f"   Created {len(weather_features)} weather features")
-
-    # ========================================================================
-    # UTILITY METHODS
-    # ========================================================================
-
-    def get_feature_list(self, exclude_target: bool = True) -> List[str]:
-        """
-        Get list of engineered features
-
-        Args:
-            exclude_target: Exclude sales and oos_adjusted_sales
-
-        Returns:
-            List of feature column names
-        """
-        exclude_cols = [
-            'date', 'category', 'sales', 'oos_adjusted_sales',
-            'sku_id'  # In case it exists
-        ]
-
-        if exclude_target:
-            feature_cols = [col for col in self.df.columns if col not in exclude_cols]
-        else:
-            feature_cols = [col for col in self.df.columns
-                          if col not in ['date', 'category', 'sku_id']]
-
-        return feature_cols
-
-    def get_feature_summary(self) -> pd.DataFrame:
-        """
-        Get summary statistics for all features
-
-        Returns:
-            Summary DataFrame
-        """
-        feature_cols = self.get_feature_list(exclude_target=False)
-        return self.df[feature_cols].describe()
 
     def check_missing_values(self) -> pd.Series:
         """
@@ -391,24 +322,3 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     engineer.check_missing_values()
 
     return df_features
-
-
-if __name__ == "__main__":
-    # Test feature engineering
-    print("Testing feature engineering module...")
-
-    # Load category data
-    category_df = pd.read_csv("data/category_day_data.csv")
-    category_df['date'] = pd.to_datetime(category_df['date'])
-
-    # Engineer features
-    df_with_features = engineer_features(category_df)
-
-    # Display sample
-    print("\nSample data with features (first 5 rows):")
-    print(df_with_features.head())
-
-    # Save
-    output_path = "data/category_day_features.csv"
-    df_with_features.to_csv(output_path, index=False)
-    print(f"\nData with features saved to: {output_path}")

@@ -1,0 +1,10 @@
+season/
+outputs/
+models/
+data/*
+CLAUDE.md
+src/__pycache__/
+outputs/plots/*
+outputs/models/*
+__pycache__/
+pipeline_run.log

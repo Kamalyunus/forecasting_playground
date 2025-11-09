@@ -21,6 +21,12 @@ import joblib
 import warnings
 warnings.filterwarnings('ignore')
 
+# Import configuration
+from config import (
+    DATA_CONFIG, SPLIT_CONFIG, ETS_CONFIG, LGBM_CONFIG,
+    TUNING_CONFIG, FORECAST_CONFIG, OUTPUT_CONFIG, METRIC_TARGETS
+)
+
 # Import custom modules
 from src.data_generator import generate_and_save_data
 from src.aggregation import aggregate_to_category, validate_aggregated_data
@@ -30,32 +36,26 @@ from src.lgbm_model import LGBMResidualModel, split_train_val_test
 from src.forecast import HybridForecaster
 from src.evaluation import evaluate_by_category, evaluate_forecast_components
 from src.visualization import create_all_visualizations
+from src.hyperparameter_tuning import LGBMHyperparameterTuner, save_tuned_params, load_tuned_params
 
 
 class ForecastingPipeline:
-    """Complete forecasting pipeline"""
+    """Complete forecasting pipeline (configured via config.py)"""
 
-    def __init__(self,
-                 data_path: Optional[str] = None,
-                 generate_new_data: bool = True,
-                 output_dir: str = 'outputs'):
-        """
-        Initialize pipeline
-
-        Args:
-            data_path: Path to existing SKU-day data (if not generating)
-            generate_new_data: Whether to generate synthetic data
-            output_dir: Directory for outputs
-        """
-        self.data_path = data_path
-        self.generate_new_data = generate_new_data
-        self.output_dir = output_dir
+    def __init__(self):
+        """Initialize pipeline with config from config.py"""
+        # Load configuration
+        self.data_path = DATA_CONFIG['data_path']
+        self.generate_new_data = DATA_CONFIG['generate_new_data']
+        self.output_dir = OUTPUT_CONFIG['output_dir']
+        self.tune_hyperparameters = TUNING_CONFIG['tune_hyperparameters']
+        self.tuning_trials = TUNING_CONFIG['n_trials']
 
         # Create output directories
-        os.makedirs(f'{output_dir}/forecasts', exist_ok=True)
-        os.makedirs(f'{output_dir}/plots', exist_ok=True)
-        os.makedirs('models', exist_ok=True)
-        os.makedirs('data', exist_ok=True)
+        os.makedirs(f"{OUTPUT_CONFIG['output_dir']}/forecasts", exist_ok=True)
+        os.makedirs(f"{OUTPUT_CONFIG['output_dir']}/plots", exist_ok=True)
+        os.makedirs(OUTPUT_CONFIG['model_dir'], exist_ok=True)
+        os.makedirs(OUTPUT_CONFIG['data_dir'], exist_ok=True)
 
         # Pipeline components (will be populated)
         self.sku_df = None
@@ -69,24 +69,20 @@ class ForecastingPipeline:
         self.forecaster = None
         self.forecast_df = None
         self.metrics_df = None
+        self.tuned_params = None
 
-    def run_complete_pipeline(self,
-                             train_days: int = 640,
-                             val_days: int = 30,
-                             test_days: int = 30,
-                             forecast_horizon: int = 30) -> Dict:
+    def run_complete_pipeline(self) -> Dict:
         """
-        Run complete forecasting pipeline
-
-        Args:
-            train_days: Training period days
-            val_days: Validation period days
-            test_days: Test period days
-            forecast_horizon: Forecast horizon days
+        Run complete forecasting pipeline (configured via config.py)
 
         Returns:
             Dictionary with pipeline results
         """
+        # Load split configuration
+        train_days = SPLIT_CONFIG['train_days']
+        val_days = SPLIT_CONFIG['val_days']
+        test_days = SPLIT_CONFIG['test_days']
+        forecast_horizon = FORECAST_CONFIG['forecast_horizon']
         print("\n" + "="*80)
         print("CATEGORY-LEVEL DAILY FORECASTING PIPELINE (MVP)")
         print("="*80)
@@ -107,6 +103,18 @@ class ForecastingPipeline:
 
         # Step 5: ETS Decomposition
         self.step_5_fit_ets()
+
+        # Step 5.5: Hyperparameter Tuning (optional)
+        if self.tune_hyperparameters:
+            self.step_5_5_tune_hyperparameters()
+        else:
+            # Try to load existing tuned parameters
+            if os.path.exists(TUNING_CONFIG['tuned_params_path']):
+                print("\n" + "="*80)
+                print(f"Loading existing tuned parameters from {TUNING_CONFIG['tuned_params_path']}")
+                print("="*80)
+                self.tuned_params = load_tuned_params(TUNING_CONFIG['tuned_params_path'])
+                print(f"Loaded tuned parameters: {list(self.tuned_params.keys())}")
 
         # Step 6: LightGBM Training
         self.step_6_train_lgbm()
@@ -144,20 +152,27 @@ class ForecastingPipeline:
         print("="*80)
 
         if self.generate_new_data:
-            print("\nGenerating synthetic SKU-day data...")
-            self.sku_df = generate_and_save_data(
-                output_path="data/sku_day_data.csv",
-                start_date="2022-01-01",
-                n_days=730,
-                categories=["Beverages", "Frozen_Foods", "Bakery"],
-                skus_per_category=10,
-                seed=42
+            self.sku_df, self.weather_df = generate_and_save_data(
+                sku_output_path=f"{OUTPUT_CONFIG['data_dir']}/sku_day_data.csv",
+                weather_output_path=f"{OUTPUT_CONFIG['data_dir']}/category_day_weather.csv",
+                start_date=DATA_CONFIG['start_date'],
+                n_days=DATA_CONFIG['n_days'],
+                categories=DATA_CONFIG['categories'],
+                skus_per_category=DATA_CONFIG['skus_per_category'],
+                seed=DATA_CONFIG['seed']
             )
         else:
-            print(f"\nLoading existing data from: {self.data_path}")
+            print(f"\nLoading existing SKU data from: {self.data_path}")
             self.sku_df = pd.read_csv(self.data_path)
             self.sku_df['date'] = pd.to_datetime(self.sku_df['date'])
             print(f"Loaded {len(self.sku_df):,} SKU-day records")
+
+            # Load weather data
+            weather_path = f"{OUTPUT_CONFIG['data_dir']}/category_day_weather.csv"
+            print(f"Loading weather data from: {weather_path}")
+            self.weather_df = pd.read_csv(weather_path)
+            self.weather_df['date'] = pd.to_datetime(self.weather_df['date'])
+            print(f"Loaded {len(self.weather_df):,} category-day weather records")
 
         print("\n✓ Step 1 complete")
 
@@ -167,11 +182,11 @@ class ForecastingPipeline:
         print("STEP 2: DATA AGGREGATION (SKU → CATEGORY)")
         print("="*80)
 
-        self.category_df = aggregate_to_category(self.sku_df)
+        self.category_df = aggregate_to_category(self.sku_df, self.weather_df)
         validate_aggregated_data(self.category_df)
 
         # Save aggregated data
-        self.category_df.to_csv("data/category_day_data.csv", index=False)
+        self.category_df.to_csv(f"{OUTPUT_CONFIG['data_dir']}/category_day_data.csv", index=False)
 
         print("\n✓ Step 2 complete")
 
@@ -184,7 +199,7 @@ class ForecastingPipeline:
         self.feature_df = engineer_features(self.category_df)
 
         # Save features
-        self.feature_df.to_csv("data/category_day_features.csv", index=False)
+        self.feature_df.to_csv(f"{OUTPUT_CONFIG['data_dir']}/category_day_features.csv", index=False)
 
         print("\n✓ Step 3 complete")
 
@@ -194,13 +209,20 @@ class ForecastingPipeline:
         print("STEP 4: TRAIN/VAL/TEST SPLIT")
         print("="*80)
 
-        train_mask, val_mask, test_mask = split_train_val_test(
+        self.train_df, self.val_df, self.test_df = split_train_val_test(
             self.feature_df, train_days, val_days, test_days
         )
 
-        self.train_df = self.feature_df[train_mask].copy()
-        self.val_df = self.feature_df[val_mask].copy()
-        self.test_df = self.feature_df[test_mask].copy()
+        print("\nCreating train/val/test splits...")
+        print(f"  Total unique dates: {len(self.feature_df['date'].unique())}")
+        print(f"  Train: {train_days} days")
+        print(f"  Val: {val_days} days")
+        print(f"  Test: {test_days} days")
+
+        print("\nSplit summary:")
+        print(f"  Train: {len(self.train_df)} records ({self.train_df['date'].min()} to {self.train_df['date'].max()})")
+        print(f"  Val: {len(self.val_df)} records ({self.val_df['date'].min()} to {self.val_df['date'].max()})")
+        print(f"  Test: {len(self.test_df)} records ({self.test_df['date'].min()} to {self.test_df['date'].max()})")
 
         print("\n✓ Step 4 complete")
 
@@ -215,10 +237,13 @@ class ForecastingPipeline:
 
         self.feature_df, self.ets_decomposer = fit_ets_models(
             train_val_df,
-            seasonal_periods=365,
-            trend='add',
-            seasonal='mul',
-            damped_trend=True
+            seasonal_periods=ETS_CONFIG['seasonal_periods'],
+            trend=ETS_CONFIG['trend'],
+            seasonal=ETS_CONFIG['seasonal'],
+            damped_trend=ETS_CONFIG['damped_trend'],
+            smoothing_level=ETS_CONFIG['smoothing_level'],
+            smoothing_trend=ETS_CONFIG['smoothing_trend'],
+            smoothing_seasonal=ETS_CONFIG['smoothing_seasonal']
         )
 
         # Update splits with ETS components
@@ -234,6 +259,40 @@ class ForecastingPipeline:
 
         print("\n✓ Step 5 complete")
 
+    def step_5_5_tune_hyperparameters(self):
+        """Step 5.5: Tune hyperparameters (optional)"""
+        print("\n" + "="*80)
+        print("STEP 5.5: HYPERPARAMETER TUNING (OPTIONAL)")
+        print("="*80)
+
+        # Prepare feature columns
+        exclude_cols = [
+            'date', 'category', 'sales',
+            'ets_fitted', 'ets_residual', 'actual', 'holiday_name'
+        ]
+        feature_cols = [col for col in self.feature_df.columns if col not in exclude_cols]
+
+        # Use train + val data for tuning
+        train_val_df = pd.concat([self.train_df, self.val_df], ignore_index=True)
+        train_val_df = train_val_df.dropna(subset=['ets_residual'])
+
+        # Initialize tuner
+        tuner = LGBMHyperparameterTuner(
+            n_trials=TUNING_CONFIG['n_trials'],
+            cv_splits=TUNING_CONFIG['cv_splits'],
+            min_train_size=TUNING_CONFIG['min_train_size'],
+            val_size=TUNING_CONFIG['val_size']
+        )
+
+        # Tune pooled model
+        best_params = tuner.tune(train_val_df, feature_cols, verbose=True)
+        self.tuned_params = {'pooled': best_params}
+
+        # Save tuned parameters
+        save_tuned_params(self.tuned_params, TUNING_CONFIG['tuned_params_path'])
+
+        print("\n✓ Step 5.5 complete")
+
     def step_6_train_lgbm(self):
         """Step 6: Train LightGBM on residuals"""
         print("\n" + "="*80)
@@ -245,18 +304,24 @@ class ForecastingPipeline:
         train_mask = train_val_df['date'].isin(self.train_df['date']).values
         val_mask = train_val_df['date'].isin(self.val_df['date']).values
 
-        # Train LightGBM
-        self.lgbm_model = LGBMResidualModel()
-        self.lgbm_model.train_all_categories(
+        # Train LightGBM (pooled model)
+        if self.tuned_params:
+            print("\nUsing tuned hyperparameters from Step 5.5")
+            self.lgbm_model = LGBMResidualModel(tuned_params=self.tuned_params)
+        else:
+            print("\nUsing default hyperparameters from config")
+            self.lgbm_model = LGBMResidualModel(params=LGBM_CONFIG['params'])
+
+        self.lgbm_model.train(
             train_val_df,
             train_mask,
             val_mask,
-            num_boost_round=300,
-            early_stopping_rounds=30
+            num_boost_round=LGBM_CONFIG['num_boost_round'],
+            early_stopping_rounds=LGBM_CONFIG['early_stopping_rounds']
         )
 
         # Save model
-        joblib.dump(self.lgbm_model, 'models/lgbm_model.pkl')
+        joblib.dump(self.lgbm_model, f"{OUTPUT_CONFIG['model_dir']}/lgbm_model.pkl")
 
         print("\n✓ Step 6 complete")
 
@@ -351,14 +416,14 @@ class ForecastingPipeline:
         print("="*80)
 
         # Save ETS decomposer
-        joblib.dump(self.ets_decomposer, 'models/ets_decomposer.pkl')
+        joblib.dump(self.ets_decomposer, f"{OUTPUT_CONFIG['model_dir']}/ets_decomposer.pkl")
         print("  ✓ ETS decomposer saved")
 
         # LGBM already saved in step 6
         print("  ✓ LightGBM model saved")
 
         # Save feature importance
-        feature_importance = self.lgbm_model.get_feature_importance_summary(top_n=20)
+        feature_importance = self.lgbm_model.feature_importance.head(20)
         feature_importance.to_csv(f'{self.output_dir}/feature_importance.csv', index=False)
         print("  ✓ Feature importance saved")
 
@@ -396,10 +461,12 @@ class ForecastingPipeline:
 
             f.write("MVP SUCCESS CRITERIA\n")
             f.write("-"*80 + "\n")
-            f.write(f"Average MAPE: {avg_mape:.2f}% (Target: <20%) {'✓' if avg_mape < 20 else '✗'}\n")
-            f.write(f"Average MASE: {avg_mase:.3f} (Target: <1.0) {'✓' if avg_mase < 1.0 else '✗'}\n\n")
+            mape_target = METRIC_TARGETS['mape_target']
+            mase_target = METRIC_TARGETS['mase_target']
+            f.write(f"Average MAPE: {avg_mape:.2f}% (Target: <{mape_target}%) {'✓' if avg_mape < mape_target else '✗'}\n")
+            f.write(f"Average MASE: {avg_mase:.3f} (Target: <{mase_target}) {'✓' if avg_mase < mase_target else '✗'}\n\n")
 
-            if avg_mape < 20 and avg_mase < 1.0:
+            if avg_mape < mape_target and avg_mase < mase_target:
                 f.write("STATUS: ✓ MVP SUCCESS CRITERIA MET!\n")
             else:
                 f.write("STATUS: ⚠ MVP success criteria not fully met\n")
@@ -410,20 +477,12 @@ class ForecastingPipeline:
 
 
 def main():
-    """Main entry point"""
-    # Initialize and run pipeline
-    pipeline = ForecastingPipeline(
-        generate_new_data=True,
-        output_dir='outputs'
-    )
+    """Main entry point - all configuration is in config.py"""
+    # Initialize and run pipeline (uses config.py)
+    pipeline = ForecastingPipeline()
 
-    # Run complete pipeline
-    results = pipeline.run_complete_pipeline(
-        train_days=640,
-        val_days=30,
-        test_days=30,
-        forecast_horizon=30
-    )
+    # Run complete pipeline (uses config.py)
+    results = pipeline.run_complete_pipeline()
 
     print("\n" + "="*80)
     print("SUCCESS! Complete forecasting pipeline executed.")

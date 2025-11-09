@@ -1,129 +1,254 @@
 """
 Data Aggregation Module
 
-Aggregates SKU-day level data to Category-day level following
-volume-weighted averaging for all metrics.
+Aggregates SKU-day level data to Category-day level with instock filtering.
+Removes low-instock records and fills gaps with interpolation.
 """
 
 import pandas as pd
 import numpy as np
-from typing import Optional
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from config import AGGREGATION_CONFIG
 
 
-def aggregate_to_category(df: pd.DataFrame) -> pd.DataFrame:
+def filter_low_instock(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
     """
-    Aggregate SKU-day data to Category-day level
-
-    Aggregation rules:
-    - Sales: Sum
-    - OOS: Volume-weighted average
-    - Promotion: Calculate intensity and weighted metrics
-    - Price: Volume-weighted average
-    - Weather: Mean (assumes same geography)
-    - Holiday: Max for flags, first for continuous vars
+    Filter out SKU-day records where instock rate is below threshold
 
     Args:
         df: SKU-day level DataFrame
+        threshold: Minimum instock rate (%). If None, uses config value
+
+    Returns:
+        Filtered DataFrame
+    """
+    if threshold is None:
+        threshold = AGGREGATION_CONFIG['instock_threshold']
+
+    initial_count = len(df)
+    df_filtered = df[df['instock_rate'] >= threshold].copy()
+    filtered_count = len(df_filtered)
+    removed_count = initial_count - filtered_count
+    removed_pct = (removed_count / initial_count * 100) if initial_count > 0 else 0
+
+    print(f"\n  Instock filtering (threshold: {threshold}%):")
+    print(f"    Initial records: {initial_count:,}")
+    print(f"    Filtered records: {filtered_count:,}")
+    print(f"    Removed: {removed_count:,} ({removed_pct:.1f}%)")
+
+    return df_filtered
+
+
+def aggregate_to_category(df: pd.DataFrame,
+                         weather_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Aggregate SKU-day data to Category-day level
+
+    Expected SKU-day columns:
+        - date, sku_id, category
+        - sales
+        - instock_rate (0-100%)
+        - high_impact_promo (0/1)
+        - final_sku_price
+
+    Expected weather_df columns (category-day level):
+        - date, category
+        - avg_temperature, avg_rainfall, avg_snowfall
+        - holiday_flag (14 to -5 for holiday period, -100 otherwise)
+
+    Aggregation rules:
+        - Sales: Sum across SKUs
+        - Instock rate: Volume-weighted average
+        - Promo: Calculate intensity (% of sales on promo)
+        - Price: Volume-weighted average
+        - Weather/Holiday: Merge from category-level data
+
+    Args:
+        df: SKU-day level DataFrame
+        weather_df: Category-day level weather/holiday data (optional)
 
     Returns:
         Category-day level DataFrame
     """
-    print("Aggregating SKU-day data to Category-day level...")
+    print("="*60)
+    print("AGGREGATING SKU-DAY DATA TO CATEGORY-DAY LEVEL")
+    print("="*60)
     print(f"  Input: {len(df):,} SKU-day records")
     print(f"  Input date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"  Categories: {df['category'].nunique()}")
+    print(f"  SKUs: {df['sku_id'].nunique()}")
 
-    # Make a copy to avoid modifying original
-    df = df.copy()
+    # Step 1: Filter low instock records
+    df_filtered = filter_low_instock(df)
 
-    # Calculate sales under promotion for intensity calculation
-    df['sales_on_promo'] = df['sales'] * df['promo_flag']
+    # Step 2: Calculate sales under promotion
+    df_filtered = df_filtered.copy()
+    df_filtered['sales_on_promo'] = df_filtered['sales'] * df_filtered['high_impact_promo']
 
-    # Calculate discount percentage
-    df['discount_pct'] = np.where(
-        df['base_price'] > 0,
-        (df['base_price'] - df['final_price']) / df['base_price'],
-        0
-    )
+    # Step 3: Group by category and date
+    grouper = df_filtered.groupby(['category', 'date'])
 
-    # Group by category and date
-    grouper = df.groupby(['category', 'date'])
-
-    # Aggregation operations
+    # Step 4: Aggregation
     agg_dict = {
         # Sales - Sum
         'sales': 'sum',
 
-        # OOS - Volume-weighted average
-        'oos_loss_share': lambda x: np.average(
-            x, weights=df.loc[x.index, 'sales']
-        ) if df.loc[x.index, 'sales'].sum() > 0 else 0,
+        # Instock rate - Volume-weighted average
+        'instock_rate': lambda x: np.average(
+            x, weights=df_filtered.loc[x.index, 'sales']
+        ) if df_filtered.loc[x.index, 'sales'].sum() > 0 else x.mean(),
 
         # Sales on promo - Sum (for intensity calculation)
         'sales_on_promo': 'sum',
 
-        # Discount - Volume-weighted average
-        'discount_pct': lambda x: np.average(
-            x, weights=df.loc[x.index, 'sales']
-        ) if df.loc[x.index, 'sales'].sum() > 0 else 0,
+        # High impact promo - Count SKUs on promo
+        'high_impact_promo': 'sum',
 
         # Price - Volume-weighted average
-        'base_price': lambda x: np.average(
-            x, weights=df.loc[x.index, 'sales']
-        ) if df.loc[x.index, 'sales'].sum() > 0 else 0,
+        'final_sku_price': lambda x: np.average(
+            x, weights=df_filtered.loc[x.index, 'sales']
+        ) if df_filtered.loc[x.index, 'sales'].sum() > 0 else x.mean(),
 
-        'final_price': lambda x: np.average(
-            x, weights=df.loc[x.index, 'sales']
-        ) if df.loc[x.index, 'sales'].sum() > 0 else 0,
-
-        # Weather - Mean (same geography)
-        'temperature': 'mean',
-        'precipitation': 'mean',
-
-        # Holiday - Max for flags, first for continuous
-        'holiday_flag': 'max',
-        'days_to_holiday': 'first',
-        'days_from_holiday': 'first',
-        'holiday_name': 'first'
+        # Count of SKUs
+        'sku_id': 'count'
     }
 
-    # Perform aggregation
     category_df = grouper.agg(agg_dict).reset_index()
+    category_df.rename(columns={'sku_id': 'num_skus'}, inplace=True)
 
-    # Calculate promotion intensity
+    # Step 5: Calculate derived metrics
+    # Promo intensity (% of sales on high-impact promo)
     category_df['promo_intensity'] = np.where(
         category_df['sales'] > 0,
         category_df['sales_on_promo'] / category_df['sales'],
         0
     )
 
-    # Create binary promotion flag (>20% of sales on promotion)
+    # Binary promo flag (>20% of sales on promo)
     category_df['promo_flag'] = (category_df['promo_intensity'] > 0.2).astype(int)
 
-    # Rename discount_pct to avg_discount_pct for clarity
-    category_df.rename(columns={'discount_pct': 'avg_discount_pct'}, inplace=True)
+    # Percentage of SKUs on high impact promo (normalized feature)
+    category_df['pct_skus_on_high_impact_promo'] = np.where(
+        category_df['num_skus'] > 0,
+        category_df['high_impact_promo'] / category_df['num_skus'],
+        0
+    )
 
-    # Drop intermediate column
+    # Drop intermediate columns (keep num_skus for now but won't be used as feature)
     category_df.drop(columns=['sales_on_promo'], inplace=True)
 
-    # Sort by category and date
+    # Step 6: Merge weather and holiday data
+    if weather_df is not None:
+        print(f"\n  Merging weather/holiday data...")
+        category_df = category_df.merge(
+            weather_df[['date', 'category', 'avg_temperature', 'avg_rainfall',
+                       'avg_snowfall', 'holiday_flag']],
+            on=['date', 'category'],
+            how='left'
+        )
+        print(f"    Weather data merged")
+
+    # Step 7: Sort by category and date
     category_df.sort_values(['category', 'date'], inplace=True)
     category_df.reset_index(drop=True, inplace=True)
 
-    print(f"  Output: {len(category_df):,} Category-day records")
-    print(f"  Categories: {category_df['category'].nunique()}")
-    print(f"  Days per category: {len(category_df) // category_df['category'].nunique()}")
+    print(f"\n  Output: {len(category_df):,} Category-day records")
+    print(f"  Date range: {category_df['date'].min()} to {category_df['date'].max()}")
 
-    # Display aggregation summary
-    print("\nAggregated data summary by category:")
+    # Step 8: Fill gaps with interpolation
+    category_df = fill_gaps_with_interpolation(category_df)
+
+    # Display summary
+    print("\n  Aggregated data summary by category:")
     summary = category_df.groupby('category').agg({
         'sales': ['mean', 'std', 'min', 'max'],
+        'instock_rate': 'mean',
         'promo_intensity': 'mean',
-        'oos_loss_share': 'mean',
-        'avg_discount_pct': 'mean'
+        'pct_skus_on_high_impact_promo': 'mean',
+        'num_skus': 'mean'
     }).round(2)
     print(summary)
 
+    print("\n" + "="*60)
+    print("AGGREGATION COMPLETE")
+    print("="*60)
+
     return category_df
+
+
+def fill_gaps_with_interpolation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill missing dates with interpolation after instock filtering
+
+    For each category:
+    - Create complete date range
+    - Interpolate numeric columns for missing dates
+
+    Args:
+        df: Category-day DataFrame (may have gaps)
+
+    Returns:
+        DataFrame with filled gaps
+    """
+    method = AGGREGATION_CONFIG['interpolation_method']
+    limit = AGGREGATION_CONFIG['interpolation_limit']
+
+    print(f"\n  Filling gaps with {method} interpolation (limit: {limit} days)...")
+
+    categories = df['category'].unique()
+    filled_dfs = []
+    total_gaps_filled = 0
+
+    for category in categories:
+        cat_df = df[df['category'] == category].copy()
+
+        # Create complete date range
+        min_date = cat_df['date'].min()
+        max_date = cat_df['date'].max()
+        complete_dates = pd.date_range(start=min_date, end=max_date, freq='D')
+
+        # Check for gaps
+        existing_dates = set(cat_df['date'])
+        missing_dates = set(complete_dates) - existing_dates
+        gaps_count = len(missing_dates)
+
+        if gaps_count > 0:
+            print(f"    {category}: {gaps_count} missing dates")
+            total_gaps_filled += gaps_count
+
+            # Create complete dataframe
+            complete_df = pd.DataFrame({'date': complete_dates, 'category': category})
+            complete_df = complete_df.merge(cat_df, on=['date', 'category'], how='left')
+
+            # Interpolate numeric columns
+            numeric_cols = complete_df.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                complete_df[col] = complete_df[col].interpolate(
+                    method=method,
+                    limit=limit,
+                    limit_direction='both'
+                )
+
+            # Forward fill any remaining NaNs
+            complete_df.fillna(method='ffill', inplace=True)
+            complete_df.fillna(method='bfill', inplace=True)
+
+            filled_dfs.append(complete_df)
+        else:
+            filled_dfs.append(cat_df)
+
+    result_df = pd.concat(filled_dfs, ignore_index=True)
+    result_df.sort_values(['category', 'date'], inplace=True)
+    result_df.reset_index(drop=True, inplace=True)
+
+    if total_gaps_filled > 0:
+        print(f"    Total gaps filled: {total_gaps_filled}")
+    else:
+        print(f"    No gaps found - complete date coverage")
+
+    return result_df
 
 
 def validate_aggregated_data(df: pd.DataFrame) -> bool:
@@ -136,17 +261,16 @@ def validate_aggregated_data(df: pd.DataFrame) -> bool:
     Returns:
         True if validation passes
     """
-    print("\nValidating aggregated data...")
+    print("\n" + "="*60)
+    print("VALIDATING AGGREGATED DATA")
+    print("="*60)
 
     checks_passed = True
 
     # Check for required columns
     required_cols = [
-        'category', 'date', 'sales', 'oos_loss_share',
-        'promo_intensity', 'promo_flag', 'avg_discount_pct',
-        'temperature', 'precipitation', 'holiday_flag',
-        'days_to_holiday', 'days_from_holiday', 'holiday_name',
-        'base_price', 'final_price'
+        'category', 'date', 'sales', 'instock_rate',
+        'promo_intensity', 'promo_flag', 'final_sku_price', 'num_skus'
     ]
 
     missing_cols = [col for col in required_cols if col not in df.columns]
@@ -172,12 +296,12 @@ def validate_aggregated_data(df: pd.DataFrame) -> bool:
     else:
         print(f"  ✓ No negative sales")
 
-    # Check OOS in valid range [0, 1]
-    if not df['oos_loss_share'].between(0, 1).all():
-        print(f"  ✗ OOS loss share outside [0, 1] range")
+    # Check instock rate in valid range [0, 100]
+    if not df['instock_rate'].between(0, 100).all():
+        print(f"  ✗ Instock rate outside [0, 100] range")
         checks_passed = False
     else:
-        print(f"  ✓ OOS loss share in valid range")
+        print(f"  ✓ Instock rate in valid range")
 
     # Check promo intensity in valid range [0, 1]
     if not df['promo_intensity'].between(0, 1).all():
@@ -187,55 +311,22 @@ def validate_aggregated_data(df: pd.DataFrame) -> bool:
         print(f"  ✓ Promo intensity in valid range")
 
     # Check date continuity for each category
+    print("\n  Date continuity check:")
     for category in df['category'].unique():
         cat_dates = df[df['category'] == category]['date'].sort_values()
         expected_days = (cat_dates.max() - cat_dates.min()).days + 1
         actual_days = len(cat_dates)
 
         if expected_days != actual_days:
-            print(f"  ⚠ {category}: Date gaps detected ({actual_days}/{expected_days} days)")
+            print(f"    ⚠ {category}: Date gaps detected ({actual_days}/{expected_days} days)")
         else:
-            print(f"  ✓ {category}: Complete date sequence")
+            print(f"    ✓ {category}: Complete date sequence")
 
     if checks_passed:
         print("\n✓ All validation checks passed!")
     else:
         print("\n✗ Some validation checks failed!")
 
+    print("="*60)
+
     return checks_passed
-
-
-def save_aggregated_data(df: pd.DataFrame,
-                        output_path: str = "data/category_day_data.csv") -> None:
-    """
-    Save aggregated category-day data
-
-    Args:
-        df: Category-day DataFrame
-        output_path: Output file path
-    """
-    df.to_csv(output_path, index=False)
-    print(f"\nAggregated data saved to: {output_path}")
-    print(f"File size: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-
-
-if __name__ == "__main__":
-    # Test aggregation
-    print("Testing aggregation module...")
-
-    # Load SKU data
-    sku_df = pd.read_csv("data/sku_day_data.csv")
-    sku_df['date'] = pd.to_datetime(sku_df['date'])
-
-    # Aggregate
-    category_df = aggregate_to_category(sku_df)
-
-    # Validate
-    validate_aggregated_data(category_df)
-
-    # Save
-    save_aggregated_data(category_df)
-
-    # Display sample
-    print("\nSample aggregated data (first 10 rows):")
-    print(category_df.head(10))
