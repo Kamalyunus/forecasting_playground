@@ -1,8 +1,8 @@
 """
 Data Aggregation Module
 
-Aggregates SKU-day level data to Category-day level with instock filtering.
-Removes low-instock records and fills gaps with interpolation.
+Aggregates SKU-day level data to Category-day level with SKU-level interpolation.
+Interpolates low-instock SKU records before aggregation to preserve SKU-specific patterns.
 """
 
 import pandas as pd
@@ -15,30 +15,89 @@ from config import AGGREGATION_CONFIG
 
 def filter_low_instock(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
     """
-    Filter out SKU-day records where instock rate is below threshold
+    Interpolate SKU-day records where instock rate is below threshold
+
+    For each SKU:
+    - Interior gaps (low instock between good days): Linear interpolation
+    - Trailing gaps (low instock till end): Forward-fill from last good value
 
     Args:
         df: SKU-day level DataFrame
         threshold: Minimum instock rate (%). If None, uses config value
 
     Returns:
-        Filtered DataFrame
+        DataFrame with interpolated values for low-instock periods
     """
     if threshold is None:
         threshold = AGGREGATION_CONFIG['instock_threshold']
 
+    method = AGGREGATION_CONFIG['interpolation_method']
+    limit = AGGREGATION_CONFIG['interpolation_limit']
+
     initial_count = len(df)
-    df_filtered = df[df['instock_rate'] >= threshold].copy()
-    filtered_count = len(df_filtered)
-    removed_count = initial_count - filtered_count
-    removed_pct = (removed_count / initial_count * 100) if initial_count > 0 else 0
+    low_instock_count = (df['instock_rate'] < threshold).sum()
 
-    print(f"\n  Instock filtering (threshold: {threshold}%):")
-    print(f"    Initial records: {initial_count:,}")
-    print(f"    Filtered records: {filtered_count:,}")
-    print(f"    Removed: {removed_count:,} ({removed_pct:.1f}%)")
+    print(f"\n  SKU-level interpolation for low instock (threshold: {threshold}%):")
+    print(f"    Total records: {initial_count:,}")
+    print(f"    Records below threshold: {low_instock_count:,} ({low_instock_count/initial_count*100:.1f}%)")
 
-    return df_filtered
+    if low_instock_count == 0:
+        print(f"    No interpolation needed")
+        return df
+
+    df_interpolated = df.copy()
+    skus = df_interpolated['sku_id'].unique()
+    interpolated_count = 0
+    forward_filled_count = 0
+
+    for sku in skus:
+        sku_mask = df_interpolated['sku_id'] == sku
+        sku_data = df_interpolated[sku_mask].copy()
+        sku_data = sku_data.sort_values('date').reset_index(drop=True)
+
+        # Identify low instock records
+        low_instock_mask = sku_data['instock_rate'] < threshold
+
+        if not low_instock_mask.any():
+            continue
+
+        # Mark values to interpolate
+        numeric_cols = ['sales', 'instock_rate', 'final_sku_price']
+        for col in numeric_cols:
+            if col in sku_data.columns:
+                # Create a copy with NaN for low instock values
+                values = sku_data[col].copy()
+                values[low_instock_mask] = np.nan
+
+                # Interpolate (handles interior gaps)
+                interpolated = values.interpolate(
+                    method=method,
+                    limit=limit,
+                    limit_direction='both'
+                )
+
+                # Track what was interpolated vs forward-filled
+                was_nan_before_interp = values.isna()
+                still_nan_after_interp = interpolated.isna()
+
+                # Forward fill remaining NaNs (trailing gaps)
+                final_values = interpolated.ffill()
+
+                # Update the dataframe
+                df_interpolated.loc[sku_mask, col] = final_values.values
+
+                # Count interpolations
+                if col == 'sales':  # Count once per row
+                    interpolated_count += (was_nan_before_interp & ~still_nan_after_interp).sum()
+                    forward_filled_count += (still_nan_after_interp & ~final_values.isna()).sum()
+
+        # Update instock_rate to threshold for interpolated records (mark as "acceptable")
+        df_interpolated.loc[sku_mask & (df_interpolated['instock_rate'] < threshold), 'instock_rate'] = threshold
+
+    print(f"    Interpolated (interior gaps): {interpolated_count:,}")
+    print(f"    Forward-filled (trailing gaps): {forward_filled_count:,}")
+
+    return df_interpolated
 
 
 def aggregate_to_category(df: pd.DataFrame,
@@ -57,6 +116,10 @@ def aggregate_to_category(df: pd.DataFrame,
         - date, category
         - avg_temperature, avg_rainfall, avg_snowfall
         - holiday_flag (14 to -5 for holiday period, -100 otherwise)
+
+    Process:
+        1. Interpolate low-instock SKU-day records (preserves SKU patterns)
+        2. Aggregate to category-day level
 
     Aggregation rules:
         - Sales: Sum across SKUs
@@ -80,15 +143,15 @@ def aggregate_to_category(df: pd.DataFrame,
     print(f"  Categories: {df['category'].nunique()}")
     print(f"  SKUs: {df['sku_id'].nunique()}")
 
-    # Step 1: Filter low instock records
-    df_filtered = filter_low_instock(df)
+    # Step 1: Interpolate low instock records at SKU level
+    df_interpolated = filter_low_instock(df)
 
     # Step 2: Calculate sales under promotion
-    df_filtered = df_filtered.copy()
-    df_filtered['sales_on_promo'] = df_filtered['sales'] * df_filtered['high_impact_promo']
+    df_interpolated = df_interpolated.copy()
+    df_interpolated['sales_on_promo'] = df_interpolated['sales'] * df_interpolated['high_impact_promo']
 
     # Step 3: Group by category and date
-    grouper = df_filtered.groupby(['category', 'date'])
+    grouper = df_interpolated.groupby(['category', 'date'])
 
     # Step 4: Aggregation
     agg_dict = {
@@ -97,8 +160,8 @@ def aggregate_to_category(df: pd.DataFrame,
 
         # Instock rate - Volume-weighted average
         'instock_rate': lambda x: np.average(
-            x, weights=df_filtered.loc[x.index, 'sales']
-        ) if df_filtered.loc[x.index, 'sales'].sum() > 0 else x.mean(),
+            x, weights=df_interpolated.loc[x.index, 'sales']
+        ) if df_interpolated.loc[x.index, 'sales'].sum() > 0 else x.mean(),
 
         # Sales on promo - Sum (for intensity calculation)
         'sales_on_promo': 'sum',
@@ -108,8 +171,8 @@ def aggregate_to_category(df: pd.DataFrame,
 
         # Price - Volume-weighted average
         'final_sku_price': lambda x: np.average(
-            x, weights=df_filtered.loc[x.index, 'sales']
-        ) if df_filtered.loc[x.index, 'sales'].sum() > 0 else x.mean(),
+            x, weights=df_interpolated.loc[x.index, 'sales']
+        ) if df_interpolated.loc[x.index, 'sales'].sum() > 0 else x.mean(),
 
         # Count of SKUs
         'sku_id': 'count'
@@ -157,9 +220,6 @@ def aggregate_to_category(df: pd.DataFrame,
     print(f"\n  Output: {len(category_df):,} Category-day records")
     print(f"  Date range: {category_df['date'].min()} to {category_df['date'].max()}")
 
-    # Step 8: Fill gaps with interpolation
-    category_df = fill_gaps_with_interpolation(category_df)
-
     # Display summary
     print("\n  Aggregated data summary by category:")
     summary = category_df.groupby('category').agg({
@@ -176,79 +236,6 @@ def aggregate_to_category(df: pd.DataFrame,
     print("="*60)
 
     return category_df
-
-
-def fill_gaps_with_interpolation(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fill missing dates with interpolation after instock filtering
-
-    For each category:
-    - Create complete date range
-    - Interpolate numeric columns for missing dates
-
-    Args:
-        df: Category-day DataFrame (may have gaps)
-
-    Returns:
-        DataFrame with filled gaps
-    """
-    method = AGGREGATION_CONFIG['interpolation_method']
-    limit = AGGREGATION_CONFIG['interpolation_limit']
-
-    print(f"\n  Filling gaps with {method} interpolation (limit: {limit} days)...")
-
-    categories = df['category'].unique()
-    filled_dfs = []
-    total_gaps_filled = 0
-
-    for category in categories:
-        cat_df = df[df['category'] == category].copy()
-
-        # Create complete date range
-        min_date = cat_df['date'].min()
-        max_date = cat_df['date'].max()
-        complete_dates = pd.date_range(start=min_date, end=max_date, freq='D')
-
-        # Check for gaps
-        existing_dates = set(cat_df['date'])
-        missing_dates = set(complete_dates) - existing_dates
-        gaps_count = len(missing_dates)
-
-        if gaps_count > 0:
-            print(f"    {category}: {gaps_count} missing dates")
-            total_gaps_filled += gaps_count
-
-            # Create complete dataframe
-            complete_df = pd.DataFrame({'date': complete_dates, 'category': category})
-            complete_df = complete_df.merge(cat_df, on=['date', 'category'], how='left')
-
-            # Interpolate numeric columns
-            numeric_cols = complete_df.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                complete_df[col] = complete_df[col].interpolate(
-                    method=method,
-                    limit=limit,
-                    limit_direction='both'
-                )
-
-            # Forward fill any remaining NaNs
-            complete_df.fillna(method='ffill', inplace=True)
-            complete_df.fillna(method='bfill', inplace=True)
-
-            filled_dfs.append(complete_df)
-        else:
-            filled_dfs.append(cat_df)
-
-    result_df = pd.concat(filled_dfs, ignore_index=True)
-    result_df.sort_values(['category', 'date'], inplace=True)
-    result_df.reset_index(drop=True, inplace=True)
-
-    if total_gaps_filled > 0:
-        print(f"    Total gaps filled: {total_gaps_filled}")
-    else:
-        print(f"    No gaps found - complete date coverage")
-
-    return result_df
 
 
 def validate_aggregated_data(df: pd.DataFrame) -> bool:
