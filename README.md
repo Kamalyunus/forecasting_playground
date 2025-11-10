@@ -132,12 +132,16 @@ import pandas as pd
 # Load your SKU-day data
 sku_df = pd.read_csv('your_data.csv')
 
-# Required columns:
+# Required SKU-day columns:
 # - date, sku_id, category, sales
-# - oos_loss_share, promo_flag, promo_type
-# - base_price, final_price
-# - temperature, precipitation
-# - holiday_flag, days_to_holiday, days_from_holiday, holiday_name
+# - instock_rate (0-100%, for interpolation)
+# - high_impact_promo (0/1 indicator)
+# - final_sku_price
+#
+# Required Category-day weather/holiday data (separate file):
+# - date, category
+# - avg_temperature, avg_rainfall, avg_snowfall
+# - holiday_flag (14 to -5 for holiday period, -100 otherwise)
 
 # Run pipeline
 pipeline = ForecastingPipeline(
@@ -200,9 +204,9 @@ lgbm_model = LGBMResidualModel(params={
 ### Aggregation Features (1)
 - pct_skus_on_high_impact_promo (percentage of SKUs on high-impact promotions)
 
-### Holiday Features (5)
-- days_to_holiday, days_from_holiday
+### Holiday Features (3)
 - is_pre_holiday, is_holiday_peak, is_post_holiday
+  (Derived from holiday_flag: 14 to -5 for holiday period)
 
 ### Weather Features (6)
 - temperature, precipitation, temp_deviation
